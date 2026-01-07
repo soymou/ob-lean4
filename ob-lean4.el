@@ -4,6 +4,8 @@
 
 (require 'org)
 (require 'ob)
+(require 'cl-lib)
+(require 'rx)
 
 (defgroup ob-lean4 nil
   "Org-babel support for Lean 4."
@@ -28,8 +30,18 @@
     "declare_syntax_cat" "import" "opaque")
   "List of Lean 4 keywords that start a command.")
 
+(defconst ob-lean4-def-regex
+  (rx line-start
+      (zero-or-more space)
+      (optional (or "unsafe" "partial" "noncomputable") (one-or-more space))
+      (or "def" "theorem" "lemma" "example" "structure" "inductive" "class" "abbrev" "axiom" "opaque")
+      (one-or-more space)
+      (group-n 3 (one-or-more (not (any " \t\n({")))))
+  "Regex to match Lean definitions.")
+
 (defvar ob-lean4-sessions (make-hash-table :test 'equal)
-  "Hash table mapping session names to their code history (cons imports body).")
+  "Hash table mapping session names to their code history.
+Value is (cons imports persistent-blocks-list).")
 
 (defun ob-lean4--find-project-root (dir)
   "Find the root of the Lean project containing DIR (looking for lakefile.lean or lakefile.toml)."
@@ -42,57 +54,72 @@
 
 (defun ob-lean4--has-main (body)
   "Check if BODY contains a main function definition."
-  (or (string-match-p "^[ 	]*def[ 	]+main" body)
-      (string-match-p "^[ 	]*unsafe[ 	]+def[ 	]+main" body)
-      (string-match-p "^[ 	]*partial[ 	]+def[ 	]+main" body)))
+  (or (string-match-p "^[ \t]*def[ \t]+main" body)
+      (string-match-p "^[ \t]*unsafe[ \t]+def[ \t]+main" body)
+      (string-match-p "^[ \t]*partial[ \t]+def[ \t]+main" body)))
 
-(defun ob-lean4--should-eval (body)
-  "Check if BODY appears to be an expression that should be wrapped in #eval."
-  (let* ((clean-body (replace-regexp-in-string "/-.*?-/" "" 
-                                               (replace-regexp-in-string "^[ 	]*--.*$" "" body)))
-         (first-word (car (split-string clean-body))))
-    (and first-word
-         (not (string-prefix-p "#" first-word))
-         (not (member first-word ob-lean4-command-keywords)))))
+(defun ob-lean4--extract-def-name (block)
+  "Extract the name of the definition in BLOCK, if any.
+Returns the defined name or nil."
+  (if (string-match ob-lean4-def-regex block)
+      (match-string 3 block)
+    nil))
+
+(defun ob-lean4--is-command-start (str)
+  "Check if STR starts with a Lean command keyword."
+  (let ((first-word (car (split-string str))))
+    (member first-word ob-lean4-command-keywords)))
+
+(defun ob-lean4--is-transient-start (str)
+  "Check if STR starts with # (transient command)."
+  (string-prefix-p "#" (string-trim-left str)))
+
+(defun ob-lean4--process-block (text)
+  "Process a text block (chunk). Returns (type . processed-text).
+Type is :persistent or :transient."
+  (let ((clean (string-trim text)))
+    (unless (string-empty-p clean)
+      (cond
+       ((ob-lean4--is-transient-start clean)
+        (cons :transient clean))
+       ((ob-lean4--is-command-start clean)
+        (cons :persistent clean))
+       (t
+        ;; Fallback: Treat as transient (bare expression)
+        (cons :transient clean))))))
+
+(defun ob-lean4--parse-body (body)
+  "Split BODY into blocks and process them. Returns list of (type . text)."
+  (let* ((chunks (split-string body "\n[ \t]*\n" t)) ;; Split by blank lines
+         (processed (mapcar #'ob-lean4--process-block chunks)))
+    (cl-remove-if-not #'identity processed)))
 
 (defun ob-lean4--get-session-data (session)
-  "Get the (imports . body) data for SESSION."
-  (gethash session ob-lean4-sessions '(() . "")))
+  "Get the (imports . persistent-blocks) data for SESSION."
+  (gethash session ob-lean4-sessions '(() . nil)))
 
-(defun ob-lean4--clean-body-for-history (body)
-  "Remove transient commands (starting with #) from BODY for session history.
-Also attempts to normalize newlines."
-  (with-temp-buffer
-    (insert body)
-    (goto-char (point-min))
-    ;; Remove lines starting with # (eval, check, print, reduce, etc.)
-    ;; We use ^[ 	]*# to match indentation.
-    (flush-lines "^[ 	]*#")
-    ;; Remove leading/trailing whitespace
-    (let ((clean (string-trim (buffer-string))))
-      clean)))
-
-(defun ob-lean4--update-session-data (session imports body)
-  "Update the SESSION with new IMPORTS and BODY."
+(defun ob-lean4--update-session-data (session imports new-persistents)
+  "Update the SESSION with new IMPORTS and NEW-PERSISTENTS.
+Overwrites existing definitions with same name."
   (let* ((old-data (ob-lean4--get-session-data session))
-         (old-body (cdr old-data))
-         (clean-body (ob-lean4--clean-body-for-history body)))
+         (old-persistents (cdr old-data))
+         (current-persistents old-persistents))
     
-    (unless (string-empty-p clean-body)
-      ;; Avoid appending if the exact same block is already at the end of history.
-      ;; This is a simple heuristic to prevent accidental re-runs of the same definition block.
-      (let ((should-append 
-             (or (string-empty-p old-body)
-                 (not (string-suffix-p clean-body (string-trim old-body))))))
-        
-        (if should-append
-            (puthash session 
-                     (cons imports (if (string-empty-p old-body)
-                                       clean-body
-                                     (concat old-body "\n\n" clean-body)))
-                     ob-lean4-sessions)
-          ;; If we didn't append body, we still might need to update imports
-          (puthash session (cons imports old-body) ob-lean4-sessions))))))
+    (dolist (new-block new-persistents)
+      (let ((def-name (ob-lean4--extract-def-name new-block)))
+        (if def-name
+            ;; If defined name found, remove OLD blocks that define the same name
+            (setq current-persistents 
+                  (cl-remove-if (lambda (old-block)
+                                  (equal (ob-lean4--extract-def-name old-block) def-name))
+                                current-persistents))
+          ;; If no name found, fallback to exact content removal (avoid duplicates)
+          (setq current-persistents (remove new-block current-persistents))))
+      
+      ;; Append the new block
+      (setq current-persistents (append current-persistents (list new-block))))
+    
+    (puthash session (cons imports current-persistents) ob-lean4-sessions)))
 
 (defun ob-lean4-reset-session (&optional session)
   "Reset the Lean 4 session history.
@@ -120,69 +147,64 @@ This function is called by `org-babel-execute-src-block'."
                             nil))
          (build (cdr (assq :build params)))
          
-         ;; Handle Code Preparation (Eval wrapping)
-         (has-main (ob-lean4--has-main body))
-         (should-eval (and (not has-main) (ob-lean4--should-eval body)))
-         (processed-body (if should-eval (format "#eval %s" body) body))
+         ;; Parsing
+         (parsed-blocks (ob-lean4--parse-body body))
+         (current-persistents (mapcar #'cdr 
+                                     (cl-remove-if-not (lambda (x) (eq (car x) :persistent)) parsed-blocks)))
+         (current-transients (mapcar #'cdr 
+                                    (cl-remove-if-not (lambda (x) (eq (car x) :transient)) parsed-blocks)))
          
-         ;; Handle Session State
-         (session-data (if is-session (ob-lean4--get-session-data session) '(() . "")))
-         (old-imports (car session-data))
-         (old-body (cdr session-data))
+         ;; Session Handling
+         (session-data (if is-session (ob-lean4--get-session-data session) '(() . nil)))
+         (history-imports (car session-data))
+         (history-persistents (cdr session-data))
          
-         (all-imports (delete-dups (append old-imports current-imports)))
-         (full-body (if is-session
-                        (if (string-empty-p old-body)
-                            processed-body
-                          (concat old-body "\n\n" processed-body))
-                      processed-body))
-         
-         ;; Determine if we need --run (Main function check on FULL body)
-         (final-has-main (ob-lean4--has-main full-body))
-         
-         (temp-file (org-babel-temp-file "lean-"))
-         (cmd-line (if project-root
-                       (format "%s env %s %s %s" 
-                               ob-lean4-lake-command 
-                               ob-lean4-command 
-                               (if final-has-main "--run" "")
-                               (org-babel-process-file-name temp-file))
-                     (format "%s %s %s" 
-                             ob-lean4-command 
-                             (if final-has-main "--run" "")
-                             (org-babel-process-file-name temp-file)))))
+         ;; Update Session (calculate NEW history)
+         (updated-persistents history-persistents))
     
-    (when (and project-root (member build '("yes" "t" "on" "true")))
-      (let ((default-directory project-root))
-        (org-babel-eval (format "%s build" ob-lean4-lake-command) "")))
+    (when is-session
+      (ob-lean4--update-session-data session 
+                                     (delete-dups (append history-imports current-imports))
+                                     current-persistents)
+      ;; Reload updated data
+      (setq session-data (ob-lean4--get-session-data session))
+      (setq history-imports (car session-data))
+      (setq updated-persistents (cdr session-data)))
 
-    (with-temp-file temp-file
-      (dolist (imp all-imports)
-        (insert (format "import %s\n" imp)))
-      (insert full-body))
-    
-    (let ((default-directory (or project-root dir))
-          (result (org-babel-eval cmd-line "")))
+    (let* ((all-imports (if is-session 
+                            (delete-dups (append history-imports current-imports))
+                          current-imports))
+           (blocks-to-run (if is-session
+                              (append updated-persistents current-transients)
+                            (append current-persistents current-transients)))
+           (full-body (mapconcat #'identity blocks-to-run "\n\n"))
+           ;; Only use --run if the CURRENT block defines main.
+           ;; This prevents main from history being re-executed on every eval.
+           (current-has-main (ob-lean4--has-main body))
+           
+           (temp-file (org-babel-temp-file "lean-"))
+           (cmd-line (if project-root
+                         (format "%s env %s %s %s" 
+                                 ob-lean4-lake-command 
+                                 ob-lean4-command 
+                                 (if current-has-main "--run" "")
+                                 (org-babel-process-file-name temp-file))
+                       (format "%s %s %s" 
+                               ob-lean4-command 
+                               (if current-has-main "--run" "")
+                               (org-babel-process-file-name temp-file)))))
       
-      ;; Update session
-      ;; Note: We pass the ORIGINAL 'body' (not processed-body with #eval) to update,
-      ;; but the update function now cleans it itself.
-      ;; Actually, wait. If 'should-eval' is true, 'body' was just an expression.
-      ;; ob-lean4--clean-body-for-history will see "String.append ...".
-      ;; It does NOT start with #. So it will keep it.
-      ;; But an expression by itself in the history is useless (it does nothing) or might cause syntax error
-      ;; if it's not a command.
-      ;; Lean: "1+1" -> Error: unexpected token
-      ;; So we should NOT save expressions that were meant for #eval.
+      (when (and project-root (member build '("yes" "t" "on" "true")))
+        (let ((default-directory project-root))
+          (org-babel-eval (format "%s build" ob-lean4-lake-command) "")))
+
+      (with-temp-file temp-file
+        (dolist (imp all-imports)
+          (insert (format "import %s\n" imp)))
+        (insert full-body))
       
-      (when is-session
-        (if should-eval
-            ;; If it was a pure expression, we DO NOT add it to history.
-            (ob-lean4--update-session-data session all-imports "")
-          ;; Otherwise, add the body (and let the cleaner remove #check etc.)
-          (ob-lean4--update-session-data session all-imports body)))
-      
-      result)))
+      (let ((default-directory (or project-root dir)))
+        (org-babel-eval cmd-line "")))))
 
 (provide 'ob-lean4)
 ;;; ob-lean4.el ends here
