@@ -1,210 +1,146 @@
-;;; ob-lean4.el --- Org-babel support for Lean 4
+;;; ob-lean4.el --- Org-babel execution for Lean4
+
+;; Copyright (C) 2026
+
+;; Author: Gemini
+;; Version: 0.1
+;; Package-Requires: ((emacs "26.1") (org "9.0"))
+
+;;; Commentary:
+
+;; Execute Lean4 code blocks in Org-mode.
+;; Supports sessions via history concatenation.
+;; Supports output filtering per block.
 
 ;;; Code:
 
-(require 'org)
 (require 'ob)
+(require 'org)
+;; Require ob-tangle to ensure org-babel-tangle-lang-exts is defined
+(require 'ob-tangle)
 (require 'cl-lib)
-(require 'rx)
+(require 'subr-x)
 
 (defgroup ob-lean4 nil
-  "Org-babel support for Lean 4."
+  "org-babel-execute:lean4"
   :group 'org-babel)
 
 (defcustom ob-lean4-command "lean"
-  "Name of the lean executable."
-  :group 'ob-lean4
-  :type 'string)
-
-(defcustom ob-lean4-lake-command "lake"
-  "Name of the lake executable."
-  :group 'ob-lean4
-  :type 'string)
-
-(defvar org-babel-default-header-args:lean4 '())
-
-(defconst ob-lean4-command-keywords
-  '("def" "theorem" "lemma" "example" "structure" "inductive" "class" "instance" 
-    "abbrev" "axiom" "section" "namespace" "open" "variable" "universe" 
-    "set_option" "attribute" "macro" "syntax" "elab" "export" "derive" 
-    "declare_syntax_cat" "import" "opaque")
-  "List of Lean 4 keywords that start a command.")
-
-(defconst ob-lean4-def-regex
-  (rx line-start
-      (zero-or-more space)
-      (optional (or "unsafe" "partial" "noncomputable") (one-or-more space))
-      (or "def" "theorem" "lemma" "example" "structure" "inductive" "class" "abbrev" "axiom" "opaque")
-      (one-or-more space)
-      (group-n 3 (one-or-more (not (any " \t\n({")))))
-  "Regex to match Lean definitions.")
+  "Command to execute Lean4 code."
+  :type 'string
+  :group 'ob-lean4)
 
 (defvar ob-lean4-sessions (make-hash-table :test 'equal)
-  "Hash table mapping session names to their code history.
-Value is (cons imports persistent-blocks-list).")
+  "Hash table mapping session names to their state (imports . body).")
 
-(defun ob-lean4--find-project-root (dir)
-  "Find the root of the Lean project containing DIR (looking for lakefile.lean or lakefile.toml)."
-  (let ((default-directory dir))
-    (if-let ((root (locate-dominating-file dir (lambda (d)
-                                                 (or (file-exists-p (expand-file-name "lakefile.lean" d))
-                                                     (file-exists-p (expand-file-name "lakefile.toml" d)))))))
-        (expand-file-name root)
-      nil)))
+(defvar org-babel-default-header-args:lean4
+  '((:results . "output") (:exports . "both"))
+  "Default arguments for evaluating a lean4 source block.")
 
-(defun ob-lean4--has-main (body)
-  "Check if BODY contains a main function definition."
-  (or (string-match-p "^[ \t]*def[ \t]+main" body)
-      (string-match-p "^[ \t]*unsafe[ \t]+def[ \t]+main" body)
-      (string-match-p "^[ \t]*partial[ \t]+def[ \t]+main" body)))
+(defun ob-lean4--extract-imports (code)
+  "Separate CODE into imports and body.
+Returns a cons cell (imports-list . body-string)."
+  (let ((imports '())
+        (body-lines '()))
+    (dolist (line (split-string code "\n"))
+      (if (string-match-p "^[ 	]*import " line)
+          (push line imports)
+        (push line body-lines)))
+    (cons (nreverse imports) (mapconcat #'identity (nreverse body-lines) "\n"))))
 
-(defun ob-lean4--extract-def-name (block)
-  "Extract the name of the definition in BLOCK, if any.
-Returns the defined name or nil."
-  (if (string-match ob-lean4-def-regex block)
-      (match-string 3 block)
-    nil))
+(defun ob-lean4--session-name (params)
+  "Get session name from PARAMS."
+  (cdr (assq :session params)))
 
-(defun ob-lean4--is-command-start (str)
-  "Check if STR starts with a Lean command keyword."
-  (let ((first-word (car (split-string str))))
-    (member first-word ob-lean4-command-keywords)))
-
-(defun ob-lean4--is-transient-start (str)
-  "Check if STR starts with # (transient command)."
-  (string-prefix-p "#" (string-trim-left str)))
-
-(defun ob-lean4--process-block (text)
-  "Process a text block (chunk). Returns (type . processed-text).
-Type is :persistent or :transient."
-  (let ((clean (string-trim text)))
-    (unless (string-empty-p clean)
-      (cond
-       ((ob-lean4--is-transient-start clean)
-        (cons :transient clean))
-       ((ob-lean4--is-command-start clean)
-        (cons :persistent clean))
-       (t
-        ;; Fallback: Treat as transient (bare expression)
-        (cons :transient clean))))))
-
-(defun ob-lean4--parse-body (body)
-  "Split BODY into blocks and process them. Returns list of (type . text)."
-  (let* ((chunks (split-string body "\n[ \t]*\n" t)) ;; Split by blank lines
-         (processed (mapcar #'ob-lean4--process-block chunks)))
-    (cl-remove-if-not #'identity processed)))
-
-(defun ob-lean4--get-session-data (session)
-  "Get the (imports . persistent-blocks) data for SESSION."
-  (gethash session ob-lean4-sessions '(() . nil)))
-
-(defun ob-lean4--update-session-data (session imports new-persistents)
-  "Update the SESSION with new IMPORTS and NEW-PERSISTENTS.
-Overwrites existing definitions with same name."
-  (let* ((old-data (ob-lean4--get-session-data session))
-         (old-persistents (cdr old-data))
-         (current-persistents old-persistents))
-    
-    (dolist (new-block new-persistents)
-      (let ((def-name (ob-lean4--extract-def-name new-block)))
-        (if def-name
-            ;; If defined name found, remove OLD blocks that define the same name
-            (setq current-persistents 
-                  (cl-remove-if (lambda (old-block)
-                                  (equal (ob-lean4--extract-def-name old-block) def-name))
-                                current-persistents))
-          ;; If no name found, fallback to exact content removal (avoid duplicates)
-          (setq current-persistents (remove new-block current-persistents))))
-      
-      ;; Append the new block
-      (setq current-persistents (append current-persistents (list new-block))))
-    
-    (puthash session (cons imports current-persistents) ob-lean4-sessions)))
-
-(defun ob-lean4-reset-session (&optional session)
-  "Reset the Lean 4 session history.
-If SESSION is not provided, resets the 'default' session."
-  (interactive "sSession name to reset (default): ")
-  (let ((sess (if (or (null session) (string-empty-p session)) "default" session)))
-    (remhash sess ob-lean4-sessions)
-    (message "Lean 4 session '%s' cleared." sess)))
-
-(defun org-babel-lean4-initiate-session (&optional session _params)
-  "Initiate a Lean 4 session.
-Since Lean 4 does not support a persistent REPL easily, this just returns nil
-or the session name to satisfy Org Babel, while the state is managed internally."
-  session)
+(defun ob-lean4--run-process (code)
+  "Run CODE with `ob-lean4-command`.
+Return (exit-code . output)."
+  (let ((temp-file (make-temp-file "lean4-" nil ".lean")))
+    (with-temp-file temp-file (insert code))
+    (let* ((buff (get-buffer-create " *ob-lean4-output*"))
+           (exit-code 
+            (progn 
+              (with-current-buffer buff (erase-buffer))
+              (call-process ob-lean4-command nil buff nil temp-file))))
+      (let ((output (with-current-buffer buff (buffer-string))))
+        (kill-buffer buff)
+        (delete-file temp-file)
+        (cons exit-code output)))))
 
 (defun org-babel-execute:lean4 (body params)
-  "Execute a block of Lean 4 code with Babel.
+  "Execute a block of Lean4 code with Babel.
 This function is called by `org-babel-execute-src-block'."
-  (let* ((dir (expand-file-name (or (cdr (assq :dir params)) default-directory)))
-         (project-root (ob-lean4--find-project-root dir))
-         (session (cdr (assq :session params)))
+  (let* ((session (ob-lean4--session-name params))
          (is-session (and session (not (string= session "none"))))
-         (current-imports (if (cdr (assq :imports params))
-                              (split-string (cdr (assq :imports params)) "[ ,]+" t)
-                            nil))
-         (build (cdr (assq :build params)))
-         
-         ;; Parsing
-         (parsed-blocks (ob-lean4--parse-body body))
-         (current-persistents (mapcar #'cdr 
-                                     (cl-remove-if-not (lambda (x) (eq (car x) :persistent)) parsed-blocks)))
-         (current-transients (mapcar #'cdr 
-                                    (cl-remove-if-not (lambda (x) (eq (car x) :transient)) parsed-blocks)))
-         
-         ;; Session Handling
-         (session-data (if is-session (ob-lean4--get-session-data session) '(() . nil)))
-         (history-imports (car session-data))
-         (history-persistents (cdr session-data))
-         
-         ;; Update Session (calculate NEW history)
-         (updated-persistents history-persistents))
-    
-    (when is-session
-      (ob-lean4--update-session-data session 
-                                     (delete-dups (append history-imports current-imports))
-                                     current-persistents)
-      ;; Reload updated data
-      (setq session-data (ob-lean4--get-session-data session))
-      (setq history-imports (car session-data))
-      (setq updated-persistents (cdr session-data)))
+         (full-code "")
+         ;; Use a random separator
+         (separator (format "---OB-LEAN4-SEP-%04x---" (random 65535))))
 
-    (let* ((all-imports (if is-session 
-                            (delete-dups (append history-imports current-imports))
-                          current-imports))
-           (blocks-to-run (if is-session
-                              (append updated-persistents current-transients)
-                            (append current-persistents current-transients)))
-           (full-body (mapconcat #'identity blocks-to-run "\n\n"))
-           ;; Only use --run if the CURRENT block defines main.
-           ;; This prevents main from history being re-executed on every eval.
-           (current-has-main (ob-lean4--has-main body))
-           
-           (temp-file (org-babel-temp-file "lean-"))
-           (cmd-line (if project-root
-                         (format "%s env %s %s %s" 
-                                 ob-lean4-lake-command 
-                                 ob-lean4-command 
-                                 (if current-has-main "--run" "")
-                                 (org-babel-process-file-name temp-file))
-                       (format "%s %s %s" 
-                               ob-lean4-command 
-                               (if current-has-main "--run" "")
-                               (org-babel-process-file-name temp-file)))))
+    (if is-session
+        (let* ((state (gethash session ob-lean4-sessions '(() . "")))
+               (prev-imports (car state))
+               (prev-body (cdr state))
+               (curr-split (ob-lean4--extract-imports body))
+               (curr-imports (car curr-split))
+               (curr-body (cdr curr-split))
+               ;; Merge imports
+               (all-imports (cl-remove-duplicates (append prev-imports curr-imports) :test #'string=))
+               (imports-str (mapconcat #'identity all-imports "\n")))
+          
+          ;; Construct code to try
+          (setq full-code 
+                (concat imports-str "\n"
+                        prev-body "\n"
+                        (format "#eval IO.println \"%s\"\n" separator)
+                        curr-body))
+          
+          (let* ((proc-res (ob-lean4--run-process full-code))
+                 (exit-code (car proc-res))
+                 (output (cdr proc-res)))
+            
+            (if (= exit-code 0)
+                (progn
+                  ;; Update state: Add current body to history
+                  (puthash session (cons all-imports (concat prev-body "\n" curr-body)) ob-lean4-sessions)
+                  ;; Parse output
+                  (ob-lean4--filter-output output separator))
+              ;; On failure, return error but don't update state
+              output)))
       
-      (when (and project-root (member build '("yes" "t" "on" "true")))
-        (let ((default-directory project-root))
-          (org-babel-eval (format "%s build" ob-lean4-lake-command) "")))
+      ;; No session
+      (let* ((split (ob-lean4--extract-imports body))
+             (imports (car split))
+             (curr-body (cdr split)))
+        (setq full-code (concat (mapconcat #'identity imports "\n") "\n" curr-body))
+        (let ((proc-res (ob-lean4--run-process full-code)))
+          (cdr proc-res))))))
 
-      (with-temp-file temp-file
-        (dolist (imp all-imports)
-          (insert (format "import %s\n" imp)))
-        (insert full-body))
-      
-      (let ((default-directory (or project-root dir)))
-        (org-babel-eval cmd-line "")))))
+(defun ob-lean4--filter-output (output separator)
+  "Return string in OUTPUT after SEPARATOR."
+  (let ((parts (split-string output separator)))
+    (if (> (length parts) 1)
+        (string-trim (car (last parts)))
+      (string-trim output))))
+
+;; Shortcuts
+(defun ob-lean4-restart-session-command ()
+  "Restart the session named in the current block or ask user."
+  (interactive)
+  (let* ((info (ignore-errors (org-babel-get-src-block-info)))
+         (session (if info (cdr (assq :session (nth 2 info))) nil)))
+    (when (or (not session) (string= session "none"))
+      (setq session (read-string "Session to restart: ")))
+    (remhash session ob-lean4-sessions)
+    (message "Session '%s' restarted." session)))
+
+(defun ob-lean4-restart-all-sessions-command ()
+  "Restart all lean4 sessions."
+  (interactive)
+  (clrhash ob-lean4-sessions)
+  (message "All Lean4 sessions restarted."))
+
+;; Tangling
+(add-to-list 'org-babel-tangle-lang-exts '("lean4" . "lean"))
 
 (provide 'ob-lean4)
 ;;; ob-lean4.el ends here
