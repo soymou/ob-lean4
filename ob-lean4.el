@@ -1,4 +1,4 @@
-;;; ob-lean4.el --- Org-babel execution for Lean4
+;;; ob-lean4.el --- Org-babel execution for Lean4 -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 
@@ -15,9 +15,7 @@
 ;;; Code:
 
 (require 'ob)
-(require 'org)
 ;; Require ob-tangle to ensure org-babel-tangle-lang-exts is defined
-(require 'ob-tangle)
 (require 'cl-lib)
 (require 'subr-x)
 
